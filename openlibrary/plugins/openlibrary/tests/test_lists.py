@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -6,8 +7,11 @@ import pytest
 import web
 from starlette.datastructures import URL
 
+from infogami.utils.context import context as infogami_ctx
+from openlibrary.i18n import ungettext
 from openlibrary.plugins.openlibrary import lists as legacy_lists
 from openlibrary.plugins.openlibrary.lists import ListRecord
+from openlibrary.plugins.upstream.jsdef import JSDefNode
 
 
 class TestListRecord:
@@ -566,3 +570,93 @@ class TestUserListsEviction:
             legacy_lists.site.reset(token)
         fake_site.save.assert_called_once()
         delete.assert_any_call("d/people/alice")
+
+
+LIST_NAME = "Books I keep recommending"
+
+
+class TestListViewTemplate:
+    """type/list/view hands the list name to the My Books header (issue #10606)."""
+
+    @pytest.fixture(autouse=True)
+    def _english(self, request_context_fixture):
+        request_context_fixture(lang="en")
+
+    def render(self, render_template, monkeypatch, key, user):
+        calls = {}
+
+        class FakeMyBooksTemplate:
+            def __init__(self, username, page_key):
+                calls["mybooks"] = (username, page_key)
+
+            def render(self, template, header_title, page=None):
+                calls["header_title"] = header_title
+                return f'<h1 class="details-title">{header_title}</h1>{template}'
+
+        def fake_render_template(name, *args, **kwargs):
+            calls.setdefault("templates", []).append((name, args))
+            return f"<!-- {name} -->"
+
+        monkeypatch.setitem(web.template.Template.globals, "MyBooksTemplate", FakeMyBooksTemplate)
+        monkeypatch.setitem(web.template.Template.globals, "render_template", fake_render_template)
+        monkeypatch.setitem(infogami_ctx, "user", user)
+        html = render_template("type/list/view", web.storage(key=key, name=LIST_NAME), [], 0, 50, "index")
+        return html, calls
+
+    def test_the_owner_sees_the_list_name_in_the_mybooks_header(self, render_template, monkeypatch):
+        html, calls = self.render(render_template, monkeypatch, "/people/aman/lists/OL1L", web.storage(key="/people/aman"))
+        assert calls["mybooks"] == ("aman", "list")
+        assert calls["header_title"] == LIST_NAME
+        assert f'<h1 class="details-title">{LIST_NAME}</h1>' in html
+        ((name, args),) = calls["templates"]
+        assert name == "type/list/view_body"
+        assert args[1] is True  # is_owner
+
+    def test_a_visitor_sees_the_list_name_in_the_mybooks_header_too(self, render_template, monkeypatch):
+        html, calls = self.render(render_template, monkeypatch, "/people/aman/lists/OL1L", None)
+        assert calls["header_title"] == LIST_NAME
+        assert f'<h1 class="details-title">{LIST_NAME}</h1>' in html
+        ((_, args),) = calls["templates"]
+        assert args[1] is False  # is_owner
+
+    def test_a_global_list_is_not_wrapped_in_the_mybooks_header(self, render_template, monkeypatch):
+        html, calls = self.render(render_template, monkeypatch, "/lists/OL1L", web.storage(key="/people/aman"))
+        assert "mybooks" not in calls
+        ((name, args),) = calls["templates"]
+        assert name == "type/list/view_body"
+        assert args[1] is False  # is_owner
+        assert html.strip() == "<!-- type/list/view_body -->"
+
+
+class TestListViewBodyTemplate:
+    """type/list/view_body only renders its own <h1> for lists that are not wrapped in the My Books header."""
+
+    @pytest.fixture(autouse=True)
+    def _english(self, request_context_fixture):
+        request_context_fixture(lang="en")
+
+    def render(self, render_template, monkeypatch, key, is_owner=False):
+        # `$jsdef` and `ungettext` are registered by openlibrary.plugins.upstream.code.setup(), which the fixture doesn't load
+        monkeypatch.setitem(web.template.STATEMENT_NODES, "jsdef", JSDefNode)
+        monkeypatch.setitem(web.template.Template.globals, "ungettext", ungettext)
+        web.ctx.env = web.storage(REQUEST_METHOD="GET", QUERY_STRING="")
+        macros = SimpleNamespace(databarView=lambda *a, **kw: "", OlPagination=lambda *a, **kw: "", Profile=lambda *a, **kw: "")
+        monkeypatch.setitem(web.template.Template.globals, "render_template", lambda name, *a, **kw: "")
+        monkeypatch.setitem(web.template.Template.globals, "macros", macros)
+        monkeypatch.setitem(web.template.Template.globals, "request", web.storage(canonical_url=f"https://openlibrary.org{key}"))
+        monkeypatch.setitem(infogami_ctx, "user", None)
+        lst = web.storage(key=key, name=LIST_NAME, description="", seeds=[], created=datetime.now(), get_owner=lambda: None)
+        return render_template("type/list/view_body", lst, is_owner, [], 0, 50, "index")
+
+    def test_a_patron_list_leaves_the_title_to_the_mybooks_header(self, render_template, monkeypatch):
+        html = self.render(render_template, monkeypatch, "/people/aman/lists/OL1L")
+        assert 'id="contentHead"' in html  # the toolbar and item count still render for visitors
+        assert f"<h1>{LIST_NAME}</h1>" not in html
+
+    def test_a_global_list_renders_its_own_title(self, render_template, monkeypatch):
+        html = self.render(render_template, monkeypatch, "/lists/OL1L")
+        assert f"<h1>{LIST_NAME}</h1>" in html
+
+    def test_the_owner_gets_no_content_head_at_all(self, render_template, monkeypatch):
+        html = self.render(render_template, monkeypatch, "/people/aman/lists/OL1L", is_owner=True)
+        assert 'id="contentHead"' not in html

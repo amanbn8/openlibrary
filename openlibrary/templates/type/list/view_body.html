@@ -35,7 +35,9 @@ $jsdef render_seed_count(seed_count):
 $if not is_owner:
     <div id="contentHead" style="margin-bottom:0;">
         $:macros.databarView(list, edit=not list.key.startswith('/people/'))
-        <h1>$list.name</h1>
+        $# Lists under /people/ are wrapped in the My Books header, which already shows the title
+        $if not list.key.startswith('/people/'):
+            <h1>$list.name</h1>
         <p class="collapse sansserif">
             $ component_times['render_seed_count'] = time()
             <span class="darkgreen" id="list-items-count"><strong>$:render_seed_count(len(list.seeds))</strong></span>
